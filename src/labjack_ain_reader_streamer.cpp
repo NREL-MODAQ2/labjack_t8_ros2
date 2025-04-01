@@ -13,13 +13,13 @@
 #include <memory>
 #include <string>
 #include <vector>
-#include <pthread.h>
 #include <iostream>
 #include <cstdlib>
 #include <LabJackM.h>
 #include "LJM_StreamUtilities.h"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/qos.hpp"
+#include <pthread.h>
 
 #include "modaq_messages/msg/t8ainstream.hpp"
 #include "modaq_messages/msg/systemmsg.hpp"
@@ -42,6 +42,11 @@ public:
     this->declare_parameter<std::string>("ainTopic", "/labjack_ain_blank");
     std::string ainTopic = this->get_parameter("ainTopic").as_string();
 
+    this->declare_parameter<std::vector<double>>("channelScales", {1, 1, 1, 1, 1, 1, 1, 1});
+    channelScales = this->get_parameter("channelScales").as_double_array();
+    this->declare_parameter<std::vector<double>>("channelOffsets", {0, 0, 0, 0, 0, 0, 0, 0});
+    channelOffsets = this->get_parameter("channelOffsets").as_double_array();
+
     // Initialize publisher and timer
     rclcpp::QoS qos_profile(10000); // Keep last 1000 messages
 
@@ -49,7 +54,7 @@ public:
     qos_profile.reliability(rmw_qos_reliability_policy_t::RMW_QOS_POLICY_RELIABILITY_RELIABLE);
     qos_profile.durability(rmw_qos_durability_policy_t::RMW_QOS_POLICY_DURABILITY_VOLATILE);
     publisher_ = this->create_publisher<modaq_messages::msg::T8ainstream>(ainTopic, qos_profile);
-    timer_ = this->create_wall_timer(0ms, std::bind(&LabJackAINStream::timer_callback, this)); //set to 0ms because the eStreamRead function is blocking
+    publisher_sysmsg = this->create_publisher<modaq_messages::msg::Systemmsg>("/system_messenger", 10);
 
     // Allocate memory for data
     aDataSize = NUM_CHANNELS * SCANS_PER_READ;
@@ -70,7 +75,6 @@ public:
               << "Data Size: " << aDataSize << "\n";
 
     // Send system start message
-    publisher_sysmsg = this->create_publisher<modaq_messages::msg::Systemmsg>("/system_messenger", 10);
     modaq_messages::msg::Systemmsg initmsg;
     initmsg.email_option = 0;
     initmsg.header.stamp = now();
@@ -78,92 +82,111 @@ public:
     initmsg.log_enable = true;
     publisher_sysmsg->publish(initmsg);
 
-    set_thread_priority(); //set the thread priority high for more deterministic scheduling
+    set_thread_priority();
   }
 
   ~LabJackAINStream()
   {
-    // Stop the stream and close the device
-    printf("Stopping stream\n");
-    err = LJM_eStreamStop(handle);
-    ErrorCheck(err, "Stopping stream");
-    CloseOrDie(handle);
 
     // Free allocated memory
     delete[] aData;
     free(aScanList);
     std::cout << "Deconstructed!!" << std::endl;
   }
-
-private:
-  void timer_callback()
+  void stream_reader()
   {
-    // Read data from LabJack
-    err = LJM_eStreamRead(handle, aData, &deviceScanBacklog, &LJMScanBacklog);
-    // Set t0 timestamp in the message
-    streamtN = now();
-    streamt0 = subtractSecondsFromTime(streamtN, waveformPeriod);
-    msg.header.set__stamp(streamt0);
-    ErrorCheck(err, "LJM_eStreamRead");
-
-    // Display buffer backlog information
-    if (connectionType != LJM_ctUSB)
+    while (rclcpp::ok())
     {
-      err = LJM_GetStreamTCPReceiveBufferStatus(handle, &receiveBufferBytesSize, &receiveBufferBytesBacklog);
+      rclcpp::spin_some(this->get_node_base_interface());
+
+      // Read data from LabJack
+      err = LJM_eStreamRead(handle, aData, &deviceScanBacklog, &LJMScanBacklog);
+      // Set t0 timestamp in the message
+      streamtN = now();
+      streamt0 = subtractSecondsFromTime(streamtN, waveformPeriod);
+      msg.header.set__stamp(streamt0);
+      ErrorCheck(err, "LJM_eStreamRead");
+
+      // Process data from each channel and store in vectors
+      for (uint channel = 0; channel <= aDataSize - NUM_CHANNELS; channel += NUM_CHANNELS)
+      {
+        // Scales and offsets applied
+        data_vector_ain0.push_back(aData[channel] * channelScales[0] + channelOffsets[0]);
+        data_vector_ain1.push_back(aData[channel + 1] * channelScales[1] + channelOffsets[1]);
+        data_vector_ain2.push_back(aData[channel + 2] * channelScales[2] + channelOffsets[2]);
+        data_vector_ain3.push_back(aData[channel + 3] * channelScales[3] + channelOffsets[3]);
+        data_vector_ain4.push_back(aData[channel + 4] * channelScales[4] + channelOffsets[4]);
+        data_vector_ain5.push_back(aData[channel + 5] * channelScales[5] + channelOffsets[5]);
+        data_vector_ain6.push_back(aData[channel + 6] * channelScales[6] + channelOffsets[6]);
+        data_vector_ain7.push_back(aData[channel + 7] * channelScales[7] + channelOffsets[7]);
+
+        core_timer_read = aData[channel + 8] + 65536 * aData[channel + 9];
+        data_vector_core_timer.push_back(core_timer_read);
+
+        if (last_core_timer != 0)
+        {
+          int64_t wrap_delta = (int64_t)core_timer_read - (int64_t)last_core_timer;
+          if (wrap_delta < -1000000) // add 2^32 each time core_timer rolls over
+          {
+            core_timer_rollover += UINT32_MAX;
+          }
+
+          extended_core_timer = core_timer_read + core_timer_rollover;
+        }
+        last_core_timer = core_timer_read;
+        data_vector_system_time.push_back((extended_core_timer * 10) + core_timer_2_utc_offset);
+        // std::cout << "core_timer_read: " << core_timer_read << " core_timer_2_utc_offset: " << core_timer_2_utc_offset << " extended_core_timer: " << extended_core_timer << " system_time: " << (extended_core_timer * 10) + core_timer_2_utc_offset << std::endl;
+      }
+
+      // Populate message fields
+      msg.set__ain0(data_vector_ain0);
+      msg.set__ain1(data_vector_ain1);
+      msg.set__ain2(data_vector_ain2);
+      msg.set__ain3(data_vector_ain3);
+      msg.set__ain4(data_vector_ain4);
+      msg.set__ain5(data_vector_ain5);
+      msg.set__ain6(data_vector_ain6);
+      msg.set__ain7(data_vector_ain7);
+      msg.set__core_timer(data_vector_core_timer);
+      msg.set__system_time(data_vector_system_time);
+
+      // Clear vectors for next read
+      data_vector_ain0.clear();
+      data_vector_ain1.clear();
+      data_vector_ain2.clear();
+      data_vector_ain3.clear();
+      data_vector_ain4.clear();
+      data_vector_ain5.clear();
+      data_vector_ain6.clear();
+      data_vector_ain7.clear();
+      data_vector_core_timer.clear();
+      data_vector_system_time.clear();
+
+      // Count and report skipped scans
+      numSkippedScans = CountAndOutputNumSkippedScans(NUM_CHANNELS, SCANS_PER_READ, aData);
+      if (numSkippedScans)
+      {
+        {
+          totalSkippedScans += numSkippedScans;
+          RCLCPP_INFO(this->get_logger(), "LJMBacklog: %d; deviceBacklog: %d; Total skipped: %d, error: %d", LJMScanBacklog, deviceScanBacklog, totalSkippedScans, err);
+          for (int j = 0; j < NUM_CHANNELS * SCANS_PER_READ; j++)
+          {
+            std::cout << "aData" << j << ": " << aData[j] << std::endl;
+          }
+        }
+      }
+
+      // Publish the message
+      publisher_->publish(msg);
     }
-
-    // Process data from each channel and store in vectors
-    for (uint channel = 0; channel <= aDataSize - NUM_CHANNELS; channel += NUM_CHANNELS)
-    {
-      data_vector_ain0.push_back(aData[channel]);
-      data_vector_ain1.push_back(aData[channel + 1]);
-      data_vector_ain2.push_back(aData[channel + 2]);
-      data_vector_ain3.push_back(aData[channel + 3]);
-      data_vector_ain4.push_back(aData[channel + 4]);
-      data_vector_ain5.push_back(aData[channel + 5]);
-      data_vector_ain6.push_back(aData[channel + 6]);
-      data_vector_ain7.push_back(aData[channel + 7]);
-      data_vector_core_timer.push_back((aData[channel + 8] + 65536 * aData[channel + 9]) / 1e8);
-    }
-
-    // Populate message fields
-    msg.set__ain0(data_vector_ain0);
-    msg.set__ain1(data_vector_ain1);
-    msg.set__ain2(data_vector_ain2);
-    msg.set__ain3(data_vector_ain3);
-    msg.set__ain4(data_vector_ain4);
-    msg.set__ain5(data_vector_ain5);
-    msg.set__ain6(data_vector_ain6);
-    msg.set__ain7(data_vector_ain7);
-    msg.set__core_timer(data_vector_core_timer);
-
-    // Clear vectors for next read
-    data_vector_ain0.clear();
-    data_vector_ain1.clear();
-    data_vector_ain2.clear();
-    data_vector_ain3.clear();
-    data_vector_ain4.clear();
-    data_vector_ain5.clear();
-    data_vector_ain6.clear();
-    data_vector_ain7.clear();
-    data_vector_core_timer.clear();
-
-    // Count and report skipped scans
-    numSkippedScans = CountAndOutputNumSkippedScans(NUM_CHANNELS, SCANS_PER_READ, aData);
-    if (numSkippedScans)
-    {
-      printf("  %d skipped scans in this LJM_eStreamRead\n", numSkippedScans);
-      totalSkippedScans += numSkippedScans;
-    }
-    if (totalSkippedScans)
-    {
-      printf("\n****** Total number of skipped scans: %d ******\n\n", totalSkippedScans);
-    }
-
-    // Publish the message
-    publisher_->publish(msg);
+    // Stop the stream and close the device
+    printf("Stopping stream\n");
+    err = LJM_eStreamStop(handle);
+    ErrorCheck(err, "Stopping stream");
+    CloseOrDie(handle);
   }
 
+private:
   void HardcodedConfigureStream(int handle)
   {
     const int STREAM_TRIGGER_INDEX = 0;
@@ -211,6 +234,37 @@ private:
     err = LJM_NamesToAddresses(NUM_CHANNELS, channelNames, aScanList, NULL);
     ErrorCheck(err, "Getting positive channel addresses");
 
+    err = LJM_eReadAddress(handle, 61520, LJM_UINT32, &value);
+    auto core_timer_start_value = uint64_t(value);
+    // get system clock value at this moment
+    auto sysClock = std::chrono::high_resolution_clock::now().time_since_epoch();
+    acq_start_time = std::chrono::duration_cast<std::chrono::nanoseconds>(sysClock).count(); // Get system time in ns
+    printf("acq_start_time: %lld ns\n", acq_start_time);
+    auto rostime = this->now().nanoseconds();
+
+    std::cout << "ros: " << rostime << std::endl;
+    std::cout << "labjack core_timer at start: " << core_timer_start_value << std::endl;
+
+    core_timer_2_utc_offset = acq_start_time - (core_timer_start_value * 10);
+    std::cout << "core_timer 2 UTC offset: " << core_timer_2_utc_offset << std::endl;
+
+    printf("Stream started. Actual scan rate: %.02f Hz (%.02f sample rate)\n", INIT_SCAN_RATE, INIT_SCAN_RATE * NUM_CHANNELS);
+
+    modaq_messages::msg::Systemmsg streammsg;
+    streammsg.email_option = 0;
+    streammsg.header.stamp = now();
+    streammsg.header.frame_id = "labjack_ain_reader_streamer_plus_encoder";
+    streammsg.message_tag = "Labjack w/ encoder stream started";
+
+    // Include acq_start_time and core_timer_start_value in the message body
+    std::stringstream message_body;
+    message_body << "Acquisition start time: " << acq_start_time << " ns, ";
+    message_body << "Core timer start value: " << core_timer_start_value;
+    streammsg.message_body = message_body.str();
+
+    streammsg.log_enable = true;
+    publisher_sysmsg->publish(streammsg);
+
     // Start stream
     printf("\nStarting stream...\n");
     err = LJM_eStreamStart(handle, SCANS_PER_READ, NUM_CHANNELS, aScanList, &INIT_SCAN_RATE);
@@ -236,15 +290,16 @@ private:
 
     return result;
   }
-      void set_thread_priority()
+  void set_thread_priority()
+  {
+    struct sched_param param;
+    param.sched_priority = 49; // High priority
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param))
     {
-        struct sched_param param;
-        param.sched_priority = 50; // High priority
-        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param))
-        {
-            perror("pthread_setschedparam");
-        }
+      perror("pthread_setschedparam");
     }
+    RCLCPP_INFO(this->get_logger(), "setting thread priority to: %d", param.sched_priority);
+  }
 
   rclcpp::Publisher<modaq_messages::msg::T8ainstream>::SharedPtr publisher_;
   rclcpp::Publisher<modaq_messages::msg::Systemmsg>::SharedPtr publisher_sysmsg;
@@ -271,7 +326,7 @@ private:
   const char *channelNames[NUM_CHANNELS] = {"AIN0", "AIN1", "AIN2", "AIN3", "AIN4", "AIN5", "AIN6", "AIN7", "CORE_TIMER", "STREAM_DATA_CAPTURE_16"}; // need an extra 16 bit register for the core timer!
   int *aScanList = (int *)malloc(sizeof(int) * NUM_CHANNELS);
   unsigned int aDataSize;
-  double *aData;
+  double *aData, value;
   std::vector<double> data_vector_ain0;
   std::vector<double> data_vector_ain1;
   std::vector<double> data_vector_ain2;
@@ -280,19 +335,23 @@ private:
   std::vector<double> data_vector_ain5;
   std::vector<double> data_vector_ain6;
   std::vector<double> data_vector_ain7;
-  std::vector<double> data_vector_core_timer;
+  std::vector<uint64_t> data_vector_core_timer;
+  std::vector<uint64_t> data_vector_system_time;
+
+  std::vector<double> channelScales;
+  std::vector<double> channelOffsets;
   rclcpp::Time streamtN;
   double waveformPeriod;
   rclcpp::Time streamt0;
+  unsigned long core_timer_read, last_core_timer = 0;
+  unsigned long long int acq_start_time = 0, core_timer_2_utc_offset = 0, extended_core_timer = 0, core_timer_rollover = 0;
 };
 
 int main(int argc, char *argv[])
 {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<LabJackAINStream>();
-    auto executor = std::make_shared<rclcpp::executors::StaticSingleThreadedExecutor>();
-    executor->add_node(node);
-    executor->spin();
-    rclcpp::shutdown();
+  node->stream_reader();
+  rclcpp::shutdown();
   return 0;
 }
