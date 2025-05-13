@@ -253,8 +253,8 @@ private:
     modaq_messages::msg::Systemmsg streammsg;
     streammsg.email_option = 0;
     streammsg.header.stamp = now();
-    streammsg.header.frame_id = "labjack_ain_reader_streamer_plus_encoder";
-    streammsg.message_tag = "Labjack w/ encoder stream started";
+    streammsg.header.frame_id = "labjack_ain_reader_streamer";
+    streammsg.message_tag = "Labjack stream started";
 
     // Include acq_start_time and core_timer_start_value in the message body
     std::stringstream message_body;
